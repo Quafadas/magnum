@@ -1,24 +1,46 @@
 package com.augustnagro.magnum
 
-import java.sql.{Connection, JDBCType, PreparedStatement, ResultSet, Statement}
-import java.time.OffsetDateTime
-import scala.collection.View
-import scala.deriving.Mirror
+import java.sql.PreparedStatement
 import scala.reflect.ClassTag
-import scala.util.{Failure, Success, Using}
+import scala.util.Using
 
-object SqliteDbType extends DbType:
+object MsSqlDbType extends DbType:
 
   private val specImpl = new SpecImpl:
+    // SQL Server has no NULLS FIRST/LAST. MySql emulates this with a leading
+    // `col IS NULL, ` sort key, but T-SQL has no boolean expression value,
+    // so a CASE expression is needed instead.
+    override def sortSql(sort: Sort): String =
+      val nullSort = sort.nullOrder match
+        case NullOrder.Default => ""
+        case NullOrder.First =>
+          s"CASE WHEN ${sort.column} IS NULL THEN 0 ELSE 1 END, "
+        case NullOrder.Last =>
+          s"CASE WHEN ${sort.column} IS NULL THEN 1 ELSE 0 END, "
+
+      val dir = sort.direction match
+        case SortOrder.Default => ""
+        case SortOrder.Asc     => " ASC"
+        case SortOrder.Desc    => " DESC"
+
+      nullSort + sort.column + dir
+
+    // T-SQL requires OFFSET before FETCH NEXT.
     override def offsetLimitSql(
         offset: Option[Long],
         limit: Option[Int]
     ): Option[String] =
       (offset, limit) match
-        case (Some(o), Some(l)) => Some(s"LIMIT $o, $l")
-        case (Some(o), None)    => Some(s"LIMIT $o, ${Long.MaxValue}")
-        case (None, Some(l))    => Some(s"LIMIT $l")
-        case (None, None)       => None
+        case (Some(o), Some(l)) =>
+          Some(s"OFFSET $o ROWS FETCH NEXT $l ROWS ONLY")
+        case (Some(o), None) => Some(s"OFFSET $o ROWS")
+        case (None, Some(l)) => Some(s"OFFSET 0 ROWS FETCH NEXT $l ROWS ONLY")
+        case (None, None)    => None
+
+    // T-SQL rejects OFFSET/FETCH without an ORDER BY.
+    override def orderByFallback: Option[String] = Some(
+      "ORDER BY (SELECT NULL)"
+    )
 
   def buildRepoDefaults[EC, E, ID](
       tableNameSql: String,
@@ -72,8 +94,6 @@ object SqliteDbType extends DbType:
           .map((name, codec) => name + " = " + codec.queryRepr)
           .mkString(" AND ")
 
-    val insertGenKeys = eElemNamesSql.toArray
-
     val countSql = s"SELECT count(*) FROM $tableNameSql"
     val countQuery = Frag(countSql, Vector.empty, FragWriter.empty).query[Long]
     val existsByIdSql =
@@ -84,15 +104,13 @@ object SqliteDbType extends DbType:
       s"SELECT $selectKeys FROM $tableNameSql WHERE $idWhereClause"
     val deleteByIdSql =
       s"DELETE FROM $tableNameSql WHERE $idWhereClause"
-    val truncateSql = s"DELETE FROM $tableNameSql"
+    val truncateSql = s"TRUNCATE TABLE $tableNameSql"
     val truncateUpdate =
       Frag(truncateSql, Vector.empty, FragWriter.empty).update
     val insertSql =
       s"INSERT INTO $tableNameSql $ecInsertKeys VALUES (${ecCodec.queryRepr})"
     val updateSql =
       s"UPDATE $tableNameSql SET $updateKeys WHERE $idWhereClause"
-
-    val idFirstTypeName = JDBCType.valueOf(idCodec.cols.head).getName
 
     def idWriter(id: ID): FragWriter = (ps, pos) =>
       idCodec.writeSingle(id, ps, pos)
@@ -162,9 +180,9 @@ object SqliteDbType extends DbType:
       def findById(id: ID)(using con: DbCon): Option[E] =
         findByIdImpl(id, con)
 
-      def findAllById(ids: Iterable[ID])(using DbCon): Vector[E] =
+      def findAllById(ids: Iterable[ID])(using con: DbCon): Vector[E] =
         throw UnsupportedOperationException(
-          "Sqlite does not support 'ANY' keyword, and does not support long IN parameter lists. Use findById in a loop instead."
+          "MsSqlServer does not support findAllById"
         )
 
       def delete(entity: E)(using DbCon): Unit =
@@ -173,8 +191,7 @@ object SqliteDbType extends DbType:
       def deleteById(id: ID)(using con: DbCon): Unit =
         deleteByIdImpl(id, con)
 
-      def truncate()(using DbCon): Unit =
-        truncateUpdate.run()
+      def truncate()(using DbCon): Unit = truncateUpdate.run()
 
       def deleteAll(entities: Iterable[E])(using DbCon): BatchUpdateResult =
         deleteAllById(entities.map(entityToId))
@@ -196,11 +213,15 @@ object SqliteDbType extends DbType:
             ecCodec.write(entityCreators, ps)
             timed(batchUpdateResult(ps.executeBatch()))
 
-      // https://github.com/AugustNagro/magnum/issues/87#issuecomment-2591823574
       def insertReturning(entityCreator: EC)(using con: DbCon): E =
+        /** https://learn.microsoft.com/en-us/sql/t-sql/queries/output-clause-transact-sql?view=sql-server-ver16#triggers
+          *
+          * MsSQL OUTPUT INSERTED syntax is complicated by the presence of
+          * triggers on the table. Since the Repo has no way to know whether
+          * triggers exist, we cannot support.
+          */
         throw UnsupportedOperationException()
 
-      // https://github.com/AugustNagro/magnum/issues/87#issuecomment-2591823574
       def insertAllReturning(
           entityCreators: Iterable[EC]
       )(using con: DbCon): Vector[E] =
@@ -230,4 +251,4 @@ object SqliteDbType extends DbType:
 
     end new
   end buildRepoDefaults
-end SqliteDbType
+end MsSqlDbType
